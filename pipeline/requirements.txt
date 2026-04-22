@@ -1,0 +1,12 @@
+anthropic
+google-cloud-storage
+litellm
+pdf2image
+Pillow
+psycopg2-binary
+python-dotenv
+tqdm
+openpyxl
+pdfplumber
+requests
+beautifulsoup4

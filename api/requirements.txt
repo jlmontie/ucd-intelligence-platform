@@ -1,0 +1,7 @@
+anthropic
+fastapi
+google-cloud-storage
+litellm
+psycopg2-binary
+python-dotenv
+uvicorn[standard]

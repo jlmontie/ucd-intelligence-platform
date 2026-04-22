@@ -1,0 +1,48 @@
+# ── Large data files (stay local) ───────────────────────────────────────────
+issues/
+page_images/
+extracted/
+
+# ── Databases ────────────────────────────────────────────────────────────────
+*.db
+*.db-shm
+*.db-wal
+
+# ── Pipeline outputs ─────────────────────────────────────────────────────────
+projects.json
+projects.xlsx
+
+# ── Secrets ──────────────────────────────────────────────────────────────────
+.env
+*.pem
+*.key
+service-account*.json
+gcp-credentials*.json
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+*.egg
+
+# ── macOS ────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+
+# ── IDEs & tools ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.cursor/
+.claude/
+*.swp
+*.swo
+
+# ── Plan artifacts ───────────────────────────────────────────────────────────
+*.plan.pdf
