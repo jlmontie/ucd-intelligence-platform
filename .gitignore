@@ -19,6 +19,13 @@ projects.xlsx
 service-account*.json
 gcp-credentials*.json
 
+# ── Terraform ────────────────────────────────────────────────────────────────
+infra/.terraform/
+infra/.terraform.lock.hcl
+infra/terraform.tfvars
+infra/terraform.tfstate
+infra/terraform.tfstate.backup
+
 # ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
@@ -46,3 +53,6 @@ env/
 
 # ── Plan artifacts ───────────────────────────────────────────────────────────
 *.plan.pdf
+
+# ── Temporary files ──────────────────────────────────────────────────────────
+*.tmp

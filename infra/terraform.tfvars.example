@@ -1,0 +1,12 @@
+# Copy to terraform.tfvars and fill in secrets. Never commit terraform.tfvars.
+
+project         = "uc-and-d"
+region          = "us-central1"
+vertex_location = "us-east5"
+db_tier         = "db-g1-small"
+
+secret_key = ""   # generate: openssl rand -base64 32
+
+# Set these after first docker build+push:
+# api_image      = "us-central1-docker.pkg.dev/uc-and-d/ucd/ucd-api:latest"
+# frontend_image = "us-central1-docker.pkg.dev/uc-and-d/ucd/ucd-frontend:latest"

@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS projects (
     delivery_method TEXT,
     year_completed  INTEGER,
     status          TEXT,                   -- completed | under_construction | announced
-    source_article_id INTEGER REFERENCES articles(id),
+    source_article_id INTEGER REFERENCES articles(id) ON DELETE SET NULL,
     embedding       vector(1536)
 );
 
