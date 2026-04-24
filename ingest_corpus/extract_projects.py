@@ -163,8 +163,8 @@ def main():
         default=DEFAULT_THRESHOLD,
         help=f"Min signal count to flag a page (default: {DEFAULT_THRESHOLD})",
     )
-    parser.add_argument("--model", default="claude-opus-4-7",
-                        help="LiteLLM model string (default: claude-opus-4-7). "
+    parser.add_argument("--model", default="vertex_ai/claude-sonnet-4-6",
+                        help="LiteLLM model string (default: vertex_ai/claude-sonnet-4-6). "
                              "Examples: gpt-4o, gemini/gemini-2.0-flash, claude-sonnet-4-6")
     parser.add_argument("--reprocess", action="store_true", help="Ignore cached extractions and reprocess all PDFs")
     args = parser.parse_args()

@@ -25,18 +25,20 @@ from io import BytesIO
 from pathlib import Path
 
 import litellm
+import pdfplumber
+import tenacity
 from dotenv import load_dotenv
 from google.cloud import storage
 from pdf2image import convert_from_path
 from PIL import Image
 from tqdm import tqdm
 
-from db_utils import dict_cur, get_conn
+from core.db import dict_cur, get_conn
 
 load_dotenv()
 litellm.suppress_debug_info = True
 
-DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_MODEL = "vertex_ai/claude-sonnet-4-5@20250929"
 IMAGE_DPI = 150
 GCS_BUCKET = "uc-and-d-assets"
 GCS_IMAGES_PREFIX = "page_images"
@@ -75,7 +77,13 @@ def render_and_upload(pdf_path: Path, issue_id: int, gcs: storage.Client) -> lis
     return uris
 
 
-def uri_to_b64(uri: str, gcs: storage.Client, max_width: int = 1500) -> str:
+def extract_page_texts(pdf_path: Path) -> list[str]:
+    """Extract embedded text from each PDF page via pdfplumber."""
+    with pdfplumber.open(pdf_path) as pdf:
+        return [page.extract_text() or "" for page in pdf.pages]
+
+
+def uri_to_b64(uri: str, gcs: storage.Client, max_width: int = 1568) -> str:
     """Download a GCS image and return base64-encoded JPEG."""
     path = uri.removeprefix(f"gs://{GCS_BUCKET}/")
     blob = gcs.bucket(GCS_BUCKET).blob(path)
@@ -90,14 +98,21 @@ def uri_to_b64(uri: str, gcs: storage.Client, max_width: int = 1500) -> str:
 
 
 def image_content(uri: str, gcs: storage.Client) -> dict:
+    b64 = uri_to_b64(uri, gcs)
     return {
-        "type": "image",
-        "source": {"type": "base64", "media_type": "image/jpeg", "data": uri_to_b64(uri, gcs)},
+        "type": "image_url",
+        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
     }
 
 
 # ── LLM helpers ───────────────────────────────────────────────────────────────
 
+@tenacity.retry(
+    retry=tenacity.retry_if_exception_type((litellm.RateLimitError, litellm.APIConnectionError, litellm.InternalServerError)),
+    wait=tenacity.wait_exponential(multiplier=2, min=10, max=120),
+    stop=tenacity.stop_after_attempt(8),
+    before_sleep=lambda rs: tqdm.write(f"  rate limit, retrying in {rs.next_action.sleep:.0f}s..."),
+)
 def call_llm(model: str, messages: list, max_tokens: int = 4096) -> str:
     response = litellm.completion(model=model, max_tokens=max_tokens, messages=messages)
     return response.choices[0].message.content.strip()
@@ -113,7 +128,10 @@ def parse_json_response(raw: str) -> dict | list:
 
 SEGMENT_PROMPT = """You are segmenting a construction magazine issue into articles.
 
-I will show you a sequence of page images (each labelled with its page number).
+Each page is provided as extracted PDF text followed by the page image. The extracted text is
+verbatim from the PDF — treat it as authoritative for specific words, numbers, and names.
+Use the image for visual layout context (headlines, article breaks, advertisement boundaries).
+
 Group consecutive pages that belong to the same article or feature, and identify:
 - page range (start and end, inclusive)
 - article title (from the headline visible on the page)
@@ -137,23 +155,25 @@ Rules:
 """
 
 
-def segment_issue(model: str, page_uris: list[str], gcs: storage.Client) -> list[dict]:
+def segment_issue(model: str, page_uris: list[str], page_texts: list[str], gcs: storage.Client, batch_size: int = 5) -> list[dict]:
     all_segments = []
-    batch_size = 20
 
     for batch_start in range(0, len(page_uris), batch_size):
-        batch = page_uris[batch_start:batch_start + batch_size]
+        batch_uris = page_uris[batch_start:batch_start + batch_size]
+        batch_texts = page_texts[batch_start:batch_start + batch_size]
 
         content = [{"type": "text", "text": SEGMENT_PROMPT}]
-        for i, uri in enumerate(batch):
-            content.append({"type": "text", "text": f"\n--- Page {batch_start + i + 1} ---"})
+        for i, (uri, text) in enumerate(zip(batch_uris, batch_texts)):
+            page_num = batch_start + i + 1
+            content.append({"type": "text", "text": f"\n--- Page {page_num} (extracted text) ---\n{text}"})
+            content.append({"type": "text", "text": f"--- Page {page_num} (image) ---"})
             content.append(image_content(uri, gcs))
 
         raw = call_llm(model, [{"role": "user", "content": content}])
         try:
             all_segments.extend(parse_json_response(raw))
         except (json.JSONDecodeError, ValueError) as e:
-            tqdm.write(f"  WARNING: segmentation parse error (pages {batch_start+1}-{batch_start+len(batch)}): {e}")
+            tqdm.write(f"  WARNING: segmentation parse error (pages {batch_start+1}-{batch_start+len(batch_uris)}): {e}")
 
     return all_segments
 
@@ -161,6 +181,13 @@ def segment_issue(model: str, page_uris: list[str], gcs: storage.Client) -> list
 # ── Stage 2: Article extraction ────────────────────────────────────────────────
 
 EXTRACT_PROMPT = """You are extracting structured data and content from a construction magazine article.
+
+Each page is provided as extracted PDF text followed by the page image. The extracted text is
+verbatim from the PDF — treat it as the authoritative source for all specific facts: numbers,
+dollar amounts, square footages, seat counts, firm names, people names, and direct quotations.
+Use the image for visual layout context only (identifying info panels, pull quotes, bylines).
+Never substitute a value from the image if the extracted text gives you the same information
+more clearly — the text is always more accurate.
 
 I will show you the pages of a single article. Extract the following and return as JSON:
 
@@ -205,10 +232,12 @@ Return ONLY valid JSON.
 """
 
 
-def extract_article(model: str, page_uris: list[str], page_start: int, gcs: storage.Client) -> dict | None:
+def extract_article(model: str, page_uris: list[str], page_texts: list[str], page_start: int, gcs: storage.Client) -> dict | None:
     content = [{"type": "text", "text": EXTRACT_PROMPT}]
-    for i, uri in enumerate(page_uris):
-        content.append({"type": "text", "text": f"\n--- Page {page_start + i} ---"})
+    for i, (uri, text) in enumerate(zip(page_uris, page_texts)):
+        page_num = page_start + i
+        content.append({"type": "text", "text": f"\n--- Page {page_num} (extracted text) ---\n{text}"})
+        content.append({"type": "text", "text": f"--- Page {page_num} (image) ---"})
         content.append(image_content(uri, gcs))
 
     raw = call_llm(model, [{"role": "user", "content": content}], max_tokens=4096)
@@ -327,6 +356,13 @@ def ingest_issue(pdf_path: Path, model: str, conn, gcs: storage.Client, force: b
 
     if existing and force:
         with dict_cur(conn) as cur:
+            # Null out source_article_id on projects before cascade-deleting articles
+            cur.execute("""
+                UPDATE projects SET source_article_id = NULL
+                WHERE source_article_id IN (
+                    SELECT id FROM articles WHERE issue_id = %s
+                )
+            """, (existing["id"],))
             cur.execute("DELETE FROM issues WHERE id=%s", (existing["id"],))
         conn.commit()
 
@@ -340,13 +376,14 @@ def ingest_issue(pdf_path: Path, model: str, conn, gcs: storage.Client, force: b
 
     tqdm.write(f"  Rendering + uploading pages: {filename}")
     page_uris = render_and_upload(pdf_path, issue_id, gcs)
+    page_texts = extract_page_texts(pdf_path)
 
     with dict_cur(conn) as cur:
         cur.execute("UPDATE issues SET page_count=%s WHERE id=%s", (len(page_uris), issue_id))
     conn.commit()
 
     tqdm.write(f"  Segmenting {len(page_uris)} pages...")
-    segments = segment_issue(model, page_uris, gcs)
+    segments = segment_issue(model, page_uris, page_texts, gcs)
     tqdm.write(f"  Found {len(segments)} segments")
 
     for seg in segments:
@@ -369,7 +406,8 @@ def ingest_issue(pdf_path: Path, model: str, conn, gcs: storage.Client, force: b
 
         tqdm.write(f"    Extracting pages {p_start}-{p_end}: {(seg.get('title') or '(untitled)')[:60]}")
         article_uris = page_uris[p_start - 1:p_end]
-        data = extract_article(model, article_uris, p_start, gcs)
+        article_texts = page_texts[p_start - 1:p_end]
+        data = extract_article(model, article_uris, article_texts, p_start, gcs)
 
         if data:
             with dict_cur(conn) as cur:

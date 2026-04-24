@@ -10,7 +10,7 @@ A B2B research tool for *Utah Construction & Design* magazine. Ingests 100+ issu
 flowchart TD
     PDF["issues/*.pdf"] --> ingest
 
-    subgraph ingest["pipeline/ingest.py"]
+    subgraph ingest["ingest_corpus/ingest.py"]
         A1["1. Render pages to JPEG\n150 DPI, max 1024px"]
         A2["2. Upload to GCS\ngs://uc-and-d-assets/page_images/"]
         A3["3. LLM: segment issue\n→ article list"]
@@ -64,16 +64,25 @@ Infrastructure is managed with Terraform. State lives in `gs://uc-and-d-tf-state
 
 ```
 .
-├── pipeline/
+├── ingest_corpus/          # UCD magazine ingestion pipeline
 │   ├── ingest.py           # Primary ingestion pipeline (PDF → DB)
 │   ├── download_issues.py  # Scrapes utahcdmag.com/archive to download PDFs
 │   ├── extract_projects.py # Legacy text-only extractor (kept for reference)
 │   ├── make_spreadsheet.py # Exports projects.xlsx from extracted/ JSONs
-│   ├── db_utils.py         # PostgreSQL connection helpers
 │   └── requirements.txt
 │
+├── ingest_public/          # Utah project feed scrapers (UP3, DFCM, STIP, ...)
+│
+├── core/                   # Shared across both ingestion tracks
+│   ├── db.py               # PostgreSQL connection helpers
+│   ├── resolution/         # Firm + project entity resolution
+│   ├── embeddings/         # Vector column population
+│   ├── probes/             # Probe registry + runner
+│   └── geocode/            # Lat/lng enrichment
+│
 ├── db/
-│   └── schema.sql          # PostgreSQL schema (source of truth)
+│   ├── schema.sql          # PostgreSQL schema (source of truth)
+│   └── migrations/         # Forward-only migrations
 │
 ├── api/                    # FastAPI backend (Cloud Run)
 ├── frontend/               # Next.js frontend (Cloud Run)
@@ -359,9 +368,9 @@ Probes are reusable LLM extraction templates that can be re-run over articles wh
 ### Setup
 
 ```bash
-python -m venv ~/environments/ucd-database
-source ~/environments/ucd-database/bin/activate
-pip install -r pipeline/requirements.txt
+python -m venv ~/environments/ucd-platform
+source ~/environments/ucd-platform/bin/activate
+pip install -r ingest_corpus/requirements.txt
 
 cp .env.example .env
 # fill in DATABASE_URL, ANTHROPIC_API_KEY or VERTEXAI_* vars
@@ -377,7 +386,7 @@ psql -h 127.0.0.1 -p 5433 -U ucd_user -d ucd_db
 ### Run the ingestion pipeline
 
 ```bash
-cd pipeline
+cd ingest_corpus
 
 # Download all issues
 python download_issues.py

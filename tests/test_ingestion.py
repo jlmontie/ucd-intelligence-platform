@@ -5,7 +5,7 @@ Run after ingesting a small set of issues (--limit 3) to verify quality
 before committing to the full corpus.
 
 Usage:
-    cd pipeline && python -m pytest ../tests/test_ingestion.py -v
+    pytest tests/test_ingestion.py -v
 """
 
 import sys
@@ -13,8 +13,8 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
-from db_utils import dict_cur, get_conn
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from core.db import dict_cur, get_conn
 
 
 @pytest.fixture(scope="module")
