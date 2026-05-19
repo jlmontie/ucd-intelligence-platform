@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Plan §2.5: this workflow gates both ingest tracks from breaking the
+# shared schema. Schema contract test runs without a database (static
+# parse). Lint runs on Python files only. Anything that needs Cloud SQL
+# stays out of CI.
+
+jobs:
+  lint-and-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dev tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest ruff
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Schema contract test
+        run: pytest tests/test_schema_contract.py -v
