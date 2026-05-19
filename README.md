@@ -75,14 +75,20 @@ Infrastructure is managed with Terraform. State lives in `gs://uc-and-d-tf-state
 │
 ├── core/                   # Shared across both ingestion tracks
 │   ├── db.py               # PostgreSQL connection helpers
-│   ├── resolution/         # Firm + project entity resolution
-│   ├── embeddings/         # Vector column population
-│   ├── probes/             # Probe registry + runner
-│   └── geocode/            # Lat/lng enrichment
+│   ├── llm.py              # LiteLLM wrapper + retry policy + JSON parsing
+│   ├── resolution/         # Firm / project / person entity resolution
+│   │   ├── normalize.py        # Deterministic name normalizers
+│   │   ├── resolve_firms.py    # firm_mentions → canonical firms
+│   │   ├── resolve_people.py   # person_mentions → canonical people
+│   │   ├── resolve_projects.py # candidate → canonical projects + merge_projects()
+│   │   └── classify_firms.py   # firm_type from roles (rule-based)
+│   ├── embeddings/embed.py # Article / project / claim vector population
+│   ├── probes/             # Probe registry + runner + definitions/
+│   └── geocode/geocode.py  # lat/lng/county enrichment
 │
 ├── db/
 │   ├── schema.sql          # PostgreSQL schema (source of truth)
-│   └── migrations/         # Forward-only migrations
+│   └── migrations/         # Forward-only migrations (001-012)
 │
 ├── api/                    # FastAPI backend (Cloud Run)
 ├── frontend/               # Next.js frontend (Cloud Run)
@@ -96,11 +102,19 @@ Infrastructure is managed with Terraform. State lives in `gs://uc-and-d-tf-state
 │   ├── variables.tf
 │   └── outputs.tf
 │
-├── tests/
-│   └── test_ingestion.py   # Validates row counts and spot-checks known data
+├── tests/                  # pytest suite
+│   ├── test_schema_contract.py   # static parse — runs in CI without a DB
+│   ├── test_parse_issue_filename.py
+│   ├── test_parse_int.py
+│   ├── test_classify_firms.py
+│   ├── test_merge_projects.py    # integration; needs DATABASE_URL
+│   └── test_ingestion.py         # integration; row counts + spot checks
 │
+├── notebooks/              # Ad-hoc analysis (e.g. schema_smoke.ipynb)
+├── docs/execution_plan.md  # Project plan + status checklist
 ├── issues/                 # PDF source files (gitignored)
 ├── extracted/              # Per-issue JSON cache (gitignored)
+├── pyproject.toml          # ruff + pytest config
 ├── .env.example
 └── .gitignore
 ```
@@ -368,13 +382,18 @@ Probes are reusable LLM extraction templates that can be re-run over articles wh
 ### Setup
 
 ```bash
-python -m venv ~/environments/ucd-platform
+python3 -m venv ~/environments/ucd-platform --prompt ucd-platform
 source ~/environments/ucd-platform/bin/activate
 pip install -r ingest_corpus/requirements.txt
 
 cp .env.example .env
 # fill in DATABASE_URL, ANTHROPIC_API_KEY or VERTEXAI_* vars
 ```
+
+If `python` is "command not found" after `source ... activate`, the venv is
+broken (typically because the Python interpreter it was created against
+moved). Recreate it with the command above, or call the venv's interpreter
+directly: `~/environments/ucd-platform/bin/python ...`.
 
 ### Connect to Cloud SQL locally
 
@@ -385,28 +404,85 @@ psql -h 127.0.0.1 -p 5433 -U ucd_user -d ucd_db
 
 ### Run the ingestion pipeline
 
+All commands run from the **repo root** and invoke the package as a module
+(`python -m ingest_corpus.ingest`), so imports resolve correctly without
+fiddling with `PYTHONPATH`. Set `DATABASE_URL` in your shell or `.env`.
+
 ```bash
-cd ingest_corpus
+# Download all issues (writes into issues/)
+python -m ingest_corpus.download_issues
 
-# Download all issues
-python download_issues.py
+# Smoke-test re-extraction against an already-ingested issue. --reprocess
+# is non-destructive (probes are cached by content_hash, prior probe_runs
+# are preserved). --no-images skips GCS image fetch and runs probes
+# text-only — cheap, fine for prompt validation.
+python -m ingest_corpus.ingest \
+  --pdfs issues/UC-D+February+2026-spreads.pdf \
+  --reprocess --no-images
 
-# Validate with one issue
-python ingest.py --pdfs ../issues/UC-D+February+2026-spreads.pdf --limit 1 \
-  --model anthropic/claude-sonnet-4-5-20250929
+# Production: ingest a fresh issue (with images) via Vertex.
+python -m ingest_corpus.ingest --issues_dir issues/
 
-# Full corpus
-python ingest.py --issues_dir ../issues/ \
-  --model vertex_ai/claude-sonnet-4-5@20250929
+# Full-corpus run, validation-mode capped at the first 3 issues.
+python -m ingest_corpus.ingest --issues_dir issues/ --limit 3
 ```
 
-`--reprocess` re-ingests an issue even if already in the database. Without it, already-ingested issues are skipped (safe to re-run).
+Default model is `vertex_ai/gemini-2.5-flash` (chosen via three-way audit
+against Sonnet 4.5 and Gemini 2.5 Pro — Flash matched/beat Pro on every
+quality metric at ~half the runtime and ~5–10× lower token cost; Anthropic
+on Vertex was zero-quota across every region for this project). Override
+the model per call:
+
+```bash
+# Use Sonnet via Anthropic direct (requires ANTHROPIC_API_KEY)
+python -m ingest_corpus.ingest --issues_dir issues/ \
+  --model anthropic/claude-sonnet-4-5-20250929
+
+# Or set LITELLM_MODEL in the env (per-environment default)
+export LITELLM_MODEL=anthropic/claude-sonnet-4-5-20250929
+```
+
+Flag summary:
+- `--reprocess` — re-runs probes on already-ingested issues. Safe; cached
+  by `content_hash` so it's a no-op when nothing has changed.
+- `--no-images` — skip GCS image fetch; probes run text-only. ~3× cheaper.
+- `--model` — LiteLLM model string. Defaults to `vertex_ai/gemini-2.5-flash`;
+  see provider notes above.
+- `--limit N` — cap the number of *issues* processed. For single-PDF
+  validation pass `--pdfs <file>` instead.
 
 ### Run tests
 
 ```bash
-pytest tests/test_ingestion.py
+pytest                                         # full suite
+pytest tests/test_schema_contract.py           # CI-equivalent (no DB)
+DATABASE_URL=... pytest tests/test_merge_projects.py  # integration tests
 ```
+
+### Post-ingest sweeps
+
+After each reingest, run the standalone passes to populate
+fields the ingest path leaves null/placeholder:
+
+```bash
+# 1. LLM-resolve unresolved firm_mentions (catches ambiguous trigram matches).
+python -m core.resolution.resolve_firms
+
+# 2. LLM-resolve unresolved person_mentions.
+python -m core.resolution.resolve_people
+
+# 3. Classify firms by firm_type from their roles (rule-based, no LLM cost).
+python -m core.resolution.classify_firms
+
+# 4. Embeddings for articles / projects / claims. Requires OPENAI_API_KEY.
+python -m core.embeddings.embed
+
+# 5. Geocode projects with NULL lat/lng. Requires GOOGLE_MAPS_API_KEY.
+python -m core.geocode.geocode
+```
+
+All five are idempotent — only re-process rows that haven't been resolved /
+embedded / geocoded yet.
 
 ---
 
@@ -435,10 +511,22 @@ After first Docker build+push, set `api_image` and `frontend_image` in `terrafor
 
 ## LLM Cost Estimate (full corpus)
 
-104 issues · 4,291 pages · model: `claude-sonnet-4-5` ($3/1M input, $15/1M output)
+104 issues · 4,291 pages.
 
-| Pass | Input | Output | Cost |
+Sonnet 4.5 reference (was the original target before the Vertex quota wall):
+
+| Pass | Input | Output | Cost @ Sonnet 4.5 ($3/$15 per 1M) |
 |---|---|---|---|
 | Segmentation (all pages) | ~6.4M tokens | ~860K tokens | ~$32 |
 | Extraction (~35% of pages) | ~4.5M tokens | ~1.2M tokens | ~$32 |
 | **Total** | | | **~$64** |
+
+Current default — Gemini 2.5 Flash on Vertex ($0.30 input / $2.50 output
+per 1M tokens; "thinking" output is billed at the same rate as visible
+output) — measured against a real 29-page issue traced through Langfuse:
+**~$0.0074 per page**, so **~$30–35 for the full corpus** with images.
+About half that with `--no-images`. Billed against the GCP project.
+
+Earlier drafts of this doc cited a $5–10 estimate using Google AI Studio
+rates ($0.15/$0.60). Vertex pricing is different and that estimate was
+wrong.
