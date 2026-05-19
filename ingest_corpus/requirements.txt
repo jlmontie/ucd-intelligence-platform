@@ -1,5 +1,7 @@
 anthropic
 google-cloud-storage
+json_repair
+langfuse<3
 litellm
 pdf2image
 Pillow

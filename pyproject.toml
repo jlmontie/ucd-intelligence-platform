@@ -1,0 +1,20 @@
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+extend-exclude = [
+    "issues",
+    "extracted",
+    "frontend",
+    "infra",
+    "__pycache__",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = [
+    "E501",  # line too long — long SQL strings and prompts dominate
+    "B008",  # FastAPI Depends() default
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
