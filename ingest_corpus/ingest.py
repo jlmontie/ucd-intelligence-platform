@@ -271,11 +271,25 @@ def upsert_firm(cur, raw_name: str) -> int:
     """
     firm_id, confidence, _candidates = deterministic_match(cur, raw_name)
     if firm_id is None:
+        # Race-safe insert: deterministic_match can miss when the
+        # firm name normalizes to empty (e.g. "Architects, Inc." —
+        # every token is in _FIRM_SUFFIXES). ON CONFLICT DO NOTHING
+        # + RETURNING + fallback SELECT handles that case as well as
+        # any actual race with a concurrent inserter.
         cur.execute(
-            "INSERT INTO firms (name) VALUES (%s) RETURNING id",
+            """
+            INSERT INTO firms (name) VALUES (%s)
+            ON CONFLICT (name) DO NOTHING
+            RETURNING id
+            """,
             (raw_name,),
         )
-        firm_id = cur.fetchone()["id"]
+        row = cur.fetchone()
+        if row:
+            firm_id = row["id"]
+        else:
+            cur.execute("SELECT id FROM firms WHERE name = %s", (raw_name,))
+            firm_id = cur.fetchone()["id"]
         confidence = None  # signals "needs the LLM resolver"
     cur.execute(
         """
@@ -748,13 +762,25 @@ def _segment_and_extract(
             "id": article_id, "page_start": p_start, "page_end": p_end,
             "content_hash": content_hash, "title": seg.get("title"),
         }
-        _run_probes_for_article(
-            conn, article, page_texts,
-            page_uris if use_images else None,
-            model=model,
-        )
-
-        project_id, n_claims, n_quotes = materialize_from_probes(conn, article_id)
+        try:
+            _run_probes_for_article(
+                conn, article, page_texts,
+                page_uris if use_images else None,
+                model=model,
+            )
+            project_id, n_claims, n_quotes = materialize_from_probes(conn, article_id)
+        except Exception as exc:
+            # One bad article shouldn't kill a multi-hour corpus pass.
+            # Roll back the article's partial transaction so the next
+            # article starts clean, log, and continue.
+            conn.rollback()
+            stats.setdefault("article_failures", 0)
+            stats["article_failures"] += 1
+            tqdm.write(
+                f"    SKIP article_id={article_id} after error: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            continue
         if project_id:
             stats["projects"] += 1
         stats["claims"] += n_claims
@@ -890,13 +916,22 @@ def _reprocess_existing_issue(
             conn.commit()
             article["content_hash"] = new_hash
 
-        _run_probes_for_article(
-            conn, article, page_texts,
-            page_uris if use_images else None,
-            model=model,
-        )
-
-        project_id, n_claims, n_quotes = materialize_from_probes(conn, article["id"])
+        try:
+            _run_probes_for_article(
+                conn, article, page_texts,
+                page_uris if use_images else None,
+                model=model,
+            )
+            project_id, n_claims, n_quotes = materialize_from_probes(conn, article["id"])
+        except Exception as exc:
+            conn.rollback()
+            stats.setdefault("article_failures", 0)
+            stats["article_failures"] += 1
+            tqdm.write(
+                f"    SKIP article_id={article['id']} after error: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            continue
         if project_id:
             stats["projects"] += 1
         stats["claims"] += n_claims

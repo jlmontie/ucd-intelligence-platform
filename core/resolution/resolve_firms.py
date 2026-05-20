@@ -97,22 +97,31 @@ def deterministic_match(cur, raw: str) -> tuple[int | None, float, list[dict]]:
 
     If we can decide the match deterministically, candidates is empty.
     Otherwise candidates is the trigram top-k for the LLM to consider.
+
+    Steps 1 (exact case-insensitive raw match), 3 (alias match), and
+    4 (trgm) work on the raw input directly. Step 2 (normalized form
+    match) requires a non-empty normalized form — names like
+    "Architects, Inc." normalize to empty because every token is a
+    legal/industry suffix in `_FIRM_SUFFIXES`. We skip step 2 in that
+    case rather than short-circuiting the whole function, because step
+    1 still has a real chance to catch the duplicate.
     """
     norm = normalize_firm_name(raw)
-    if not norm:
-        return None, 0.0, []
 
-    # 1. Exact normalized-name hit on an existing firm.
+    # 1. Exact case-insensitive raw match — runs regardless of norm.
     cur.execute("SELECT id, name FROM firms WHERE LOWER(name) = LOWER(%s)", (raw,))
     row = cur.fetchone()
     if row:
         return row["id"], EXACT_MATCH_CONF, []
 
-    # 2. Normalized form matches an existing firm's normalized name.
-    cur.execute("SELECT id, name FROM firms")
-    for f in cur.fetchall():
-        if normalize_firm_name(f["name"]) == norm:
-            return f["id"], EXACT_MATCH_CONF, []
+    # 2. Normalized form match — skipped when norm is empty (would
+    #    otherwise produce false positives matching every other
+    #    all-suffix firm name).
+    if norm:
+        cur.execute("SELECT id, name FROM firms")
+        for f in cur.fetchall():
+            if normalize_firm_name(f["name"]) == norm:
+                return f["id"], EXACT_MATCH_CONF, []
 
     # 3. Normalized form matches a known alias.
     cur.execute(
